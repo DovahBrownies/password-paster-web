@@ -113,6 +113,15 @@
         <select id="s_layout" disabled></select>
         <p class="note">Must match the PC.</p>
       </label>
+      <label>
+        <span>Send passwords to</span>
+        <select id="s_output" disabled>
+          <option value="0">USB cable</option>
+          <option value="1">Bluetooth</option>
+        </select>
+        <p class="note">Bluetooth will not work at the Windows login screen -
+        the host's stack is not running yet. Use USB there.</p>
+      </label>
       <div>
         <label class="check">
           <input type="checkbox" id="s_pin" disabled>
@@ -126,6 +135,17 @@
       <p class="note" id="pairNote">Teach the device where this page lives, so pressing
       Settings opens it on any PC you plug into.</p>
       <button id="pairPage" disabled>Use this page for Settings</button>
+    </div>
+
+    <div style="border-top:1px solid var(--bg); margin:16px 0; padding-top:16px">
+      <strong style="font-size:14px">Bluetooth</strong>
+      <p class="note" id="bleStatus">Unknown</p>
+      <div style="display:flex; gap:10px; margin-top:8px">
+        <button id="bleDisconnect" disabled>Disconnect</button>
+        <button id="bleForget" class="danger" disabled>Forget all pairings</button>
+      </div>
+      <p class="note">A bonded host usually reconnects on its own straight after a
+      disconnect - that is what makes it work on boot. Use Forget to stop that.</p>
     </div>
 
     <button id="saveSettings" class="primary" disabled>Save settings</button>
@@ -168,8 +188,9 @@
 // ---- protocol constants, mirroring lib/pp_proto/pp_proto.h ----
 const OP = { STATUS:0x01, LIST:0x02, ADD:0x10, UPDATE:0x11, DELETE:0x12, SET_CONFIG:0x13,
              STATUS_REPLY:0x81, ITEM:0x82, LIST_END:0x83, RESULT:0x90, PENDING:0x91,
-             ATTENTION:0x92 };
-const CFG = { LAYOUT:1, REQUIRE_PIN:2, MANAGER_URL:3 };
+             BLE_STATUS:0x14, BLE_DISCONNECT:0x15, BLE_FORGET:0x16,
+             ATTENTION:0x92, BLE_STATUS_REPLY:0x84 };
+const CFG = { LAYOUT:1, REQUIRE_PIN:2, MANAGER_URL:3, OUTPUT:4 };
 const ST = ['ok','vault is locked','declined on the device','device error',
             'vault is full','value out of range','device is busy'];
 const FRAME = 63, CHUNK = 60;
@@ -249,8 +270,15 @@ const awaitResult = () => new Promise(res => { pendingResolve = res; });
 // Sent when Settings is pressed on the device. A background tab cannot
 // focus itself, so do what a page legitimately can: highlight the
 // settings card, and post a notification the user can click.
-function comeForward() {
+async function comeForward() {
   log('device asked for the settings page');
+
+  // Answer immediately. The device cannot tell a closed tab from a quiet
+  // one, so it asks and waits briefly; no reply means it opens the page
+  // by typing the URL instead. Any message counts as proof of life -
+  // STATUS is the cheapest and refreshes the controls anyway.
+  try { await send(OP.STATUS); } catch (e) { /* disconnected */ }
+
   const card = $('settings');
   card.scrollIntoView({ behavior: 'smooth', block: 'center' });
   card.classList.add('flash');
@@ -270,8 +298,8 @@ function onReport(event) {
 
   switch (op) {
     case OP.STATUS_REPLY: {
-      const [ver, unlocked, mode, count, layout] = body;
-      deviceState = { unlocked, lockMode: mode, layout };
+      const [ver, unlocked, mode, count, layout, output] = body;
+      deviceState = { unlocked, lockMode: mode, layout, output: output ?? 0 };
       applyStateToControls();
       setStatus(unlocked ? `Connected - ${count} entries` : 'Connected - device is locked',
                 unlocked ? 'on' : 'err');
@@ -282,6 +310,23 @@ function onReport(event) {
       const idx = body[0];
       const [label, user] = new TextDecoder().decode(body.subarray(1)).split('\0');
       listBuf.push({ index: idx, label, user });
+      break;
+    }
+    case OP.BLE_STATUS_REPLY: {
+      const running = body[0], connected = body[1];
+      const peer = new TextDecoder().decode(body.subarray(2)).replace(/ .*$/, '');
+      const el = $('bleStatus');
+      if (!running) {
+        el.textContent = 'Bluetooth is not running on the device.';
+        el.className = 'note';
+      } else if (connected) {
+        el.textContent = `Connected to ${peer}`;
+        el.className = 'note';
+      } else {
+        el.textContent = 'Advertising as "Password Wallet" - nothing connected.';
+        el.className = 'note';
+      }
+      $('bleDisconnect').disabled = !connected;
       break;
     }
     case OP.LIST_END:
@@ -307,6 +352,7 @@ function onReport(event) {
 // ---- UI ---------------------------------------------------------------
 function applyStateToControls() {
   $('s_layout').value = String(deviceState.layout);
+  $('s_output').value = String(deviceState.output);
   $('s_pin').checked = deviceState.lockMode === 1;
   $('pinNote').textContent = deviceState.lockMode === 1
     ? 'The key is derived from your PIN and never stored.'
@@ -344,6 +390,7 @@ function render() {
 async function refresh() {
   listBuf = [];
   await send(OP.STATUS);
+  await send(OP.BLE_STATUS);
   await send(OP.LIST);
 }
 
@@ -396,7 +443,15 @@ $('pairPage').onclick = async () => {
 
 $('saveSettings').onclick = async () => {
   const layout = Number($('s_layout').value);
+  const output = Number($('s_output').value);
   const wantPin = $('s_pin').checked ? 1 : 0;
+
+  if (output !== deviceState.output) {
+    await send(OP.SET_CONFIG, new Uint8Array([CFG.OUTPUT, output]));
+    const st = await awaitResult();
+    if (st !== 0) { setStatus(ST[st] ?? 'failed', 'err'); return; }
+    log(`output set to ${output ? 'Bluetooth' : 'USB'}`);
+  }
 
   if (layout !== deviceState.layout) {
     await send(OP.SET_CONFIG, new Uint8Array([CFG.LAYOUT, layout]));
@@ -458,7 +513,7 @@ async function attach(dev) {
   if (!device.opened) await device.open();
   device.addEventListener('inputreport', onReport);
 
-  for (const el of ['refresh', 'addBtn', 's_layout', 's_pin', 'saveSettings', 'pairPage']) {
+  for (const el of ['refresh', 'addBtn', 's_layout', 's_output', 's_pin', 'saveSettings', 'pairPage', 'bleForget']) {
     $(el).disabled = false;
   }
   setStatus('Connected', 'on');
@@ -486,6 +541,20 @@ $('connect').onclick = async () => {
 
 $('refresh').onclick = () => refresh();
 
+$('bleDisconnect').onclick = async () => {
+  await send(OP.BLE_DISCONNECT);
+  await awaitResult();
+  await send(OP.BLE_STATUS);
+};
+
+$('bleForget').onclick = async () => {
+  setStatus('Confirm on the device...', 'err');
+  await send(OP.BLE_FORGET);
+  const st = await awaitResult();
+  if (st === 0) { log('bluetooth pairings forgotten'); await send(OP.BLE_STATUS); }
+  else { setStatus(ST[st] ?? 'failed', 'err'); }
+};
+
 $('revealBtn').onclick = () => {
   const f = $('f_secret');
   const hidden = f.type === 'password';
@@ -511,7 +580,7 @@ window.addEventListener('load', async () => {
 navigator.hid?.addEventListener('disconnect', ev => {
   if (ev.device === device) {
     device = null; entries = []; render();
-    for (const el of ['refresh', 'addBtn', 's_layout', 's_pin', 'saveSettings', 'pairPage']) {
+    for (const el of ['refresh', 'addBtn', 's_layout', 's_output', 's_pin', 'saveSettings', 'pairPage', 'bleForget']) {
       $(el).disabled = true;
     }
     setStatus('Disconnected', 'err');
