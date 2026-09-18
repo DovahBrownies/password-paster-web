@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Password Wallet</title>
+<!--
+  Management panel for password-paster-esp32.
+
+  Talks to the device over WebHID, using the vendor-defined collection
+  (usage page 0xFF00) that sits alongside the keyboard collection. Chrome
+  blocks pages from the keyboard one - which is correct, and why your
+  keystrokes are safe - and leaves the vendor one reachable.
+
+  Open this file directly (file:// works) in Chrome or Edge and press
+  Connect. Nothing is installed, and no data leaves this page.
+
+  HOW "SETTINGS" ON THE DEVICE REACHES THIS PAGE
+  Two ways, cheapest first. If this page is already connected, the device
+  just sends an ATTENTION report and the page brings itself forward -
+  nothing is typed. If nothing is listening, the device opens the page by
+  typing it into Windows' Run box, which is the only way a USB device can
+  make a PC open something from nothing.
+
+  That second path is a BadUSB primitive, knowingly. What keeps it from
+  being an arbitrary-command executor is that the device stores only a
+  host-and-path - never a scheme - made of [A-Za-z0-9._~/] and prepends
+  "https://" itself. A hostile page cannot hand it a file:// address or
+  smuggle a second command through, because there is nowhere to put one.
+  Use the "Use this page for Settings" button below to pair, which needs
+  a confirmation tap on the device and shows the full address first.
+
+  Two things the device enforces that this page cannot talk it out of:
+  every change needs a tap on the touchscreen, and stored passwords are
+  never sent back here. The list below shows names and usernames only,
+  because that is genuinely all the device will tell us.
+-->
+<style>
+  :root {
+    --bg: #11161d; --surface: #1a212b; --surface-alt: #232c38;
+    --accent: #3d7eff; --danger: #e0574b; --ok: #3ddc84;
+    --text: #e8edf4; --dim: #8a97a8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px;
+  }
+  main { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 14px; }
+  .sub { color: var(--dim); margin: 0 0 24px; font-size: 14px; }
+  .bar { display: flex; gap: 10px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+  button {
+    font: inherit; border: 0; border-radius: 8px; padding: 10px 18px;
+    background: var(--surface-alt); color: var(--text); cursor: pointer;
+  }
+  button.primary { background: var(--accent); }
+  button.danger { background: var(--danger); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .status { margin-left: auto; color: var(--dim); font-size: 14px; }
+  .status.on { color: var(--ok); }
+  .status.err { color: var(--danger); }
+  section { background: var(--surface); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  section.flash { outline: 2px solid var(--accent); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--bg); }
+  th { color: var(--dim); font-weight: 600; font-size: 13px; }
+  tr:last-child td { border-bottom: 0; }
+  .empty { color: var(--dim); padding: 24px 12px; text-align: center; }
+  label { display: block; margin-bottom: 12px; }
+  label span { display: block; color: var(--dim); font-size: 13px; margin-bottom: 4px; }
+  input[type=text], input[type=password], select {
+    width: 100%; font: inherit; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--surface-alt); background: var(--surface-alt); color: var(--text);
+  }
+  .row { display: flex; gap: 20px; align-items: flex-start; }
+  .row > * { flex: 1; }
+  .check { display: flex; gap: 10px; align-items: flex-start; }
+  .check input { margin-top: 4px; }
+  .note { color: var(--dim); font-size: 13px; margin: 8px 0 0; }
+  .note.danger { color: var(--danger); }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 12px; align-items: end; }
+  #log { font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+         color: var(--dim); white-space: pre-wrap; max-height: 180px; overflow: auto; }
+  .warn { background: #2a1e1c; border-left: 3px solid var(--danger); padding: 12px 16px;
+          border-radius: 6px; margin-bottom: 20px; font-size: 14px; }
+  @media (max-width: 720px) { .row, .grid3 { display: block; } .grid3 > * { margin-bottom: 12px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Password Wallet</h1>
+  <p class="sub">Settings and credentials for your device. Nothing is installed and nothing leaves this page.</p>
+
+  <div id="unsupported" class="warn" hidden>
+    This browser has no WebHID. Use Chrome or Edge on desktop.
+  </div>
+
+  <div class="bar">
+    <button id="connect" class="primary">Connect</button>
+    <button id="refresh" disabled>Refresh</button>
+    <span id="status" class="status">Not connected</span>
+  </div>
+
+  <section id="settings">
+    <h2>Device settings</h2>
+    <div class="row">
+      <label>
+        <span>Keyboard layout</span>
+        <select id="s_layout" disabled></select>
+        <p class="note">Must match the PC. A mismatch mistypes symbols, because the
+        keyboard sends key positions and the PC decides what they mean.</p>
+      </label>
+      <div>
+        <label class="check">
+          <input type="checkbox" id="s_pin" disabled>
+          <span style="margin:0">Require a PIN to open the wallet</span>
+        </label>
+        <p class="note" id="pinNote"></p>
+      </div>
+    </div>
+    <div style="border-top:1px solid var(--bg); margin:16px 0; padding-top:16px">
+      <strong style="font-size:14px">Settings button on the device</strong>
+      <p class="note" id="pairNote">Teach the device where this page lives, so pressing
+      Settings opens it on any PC you plug into - no reflashing.</p>
+      <button id="pairPage" disabled>Use this page for Settings</button>
+    </div>
+
+    <button id="saveSettings" class="primary" disabled>Save settings</button>
+    <p class="note">Turning the PIN <strong>on</strong> sends you to the device's keypad to
+    choose one - a PIN typed here would be a PIN this PC has seen. Turning it
+    <strong>off</strong> asks you to confirm on the device.</p>
+  </section>
+
+  <section id="creds">
+    <h2>Credentials</h2>
+    <table>
+      <thead><tr><th style="width:40px">#</th><th>Name</th><th>Username</th><th style="width:90px"></th></tr></thead>
+      <tbody id="rows"><tr><td colspan="4" class="empty">Not connected</td></tr></tbody>
+    </table>
+
+    <form id="addForm" style="margin-top:20px">
+      <div class="grid3">
+        <label style="margin:0"><span>Name</span><input type="text" id="f_label" maxlength="47" placeholder="Windows login" required></label>
+        <label style="margin:0"><span>Username</span><input type="text" id="f_user" maxlength="63" placeholder="your.name"></label>
+        <label style="margin:0"><span>Password</span><input type="password" id="f_secret" maxlength="127" required></label>
+        <button type="submit" class="primary" id="addBtn" disabled>Add</button>
+      </div>
+      <p class="note">The device will ask you to <strong>confirm on its screen</strong> before saving.
+      Stored passwords are never sent back here, so the list shows names only.</p>
+    </form>
+  </section>
+
+  <section>
+    <h2>Activity</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+// ---- protocol constants, mirroring lib/pp_proto/pp_proto.h ----
+const OP = { STATUS:0x01, LIST:0x02, ADD:0x10, UPDATE:0x11, DELETE:0x12, SET_CONFIG:0x13,
+             STATUS_REPLY:0x81, ITEM:0x82, LIST_END:0x83, RESULT:0x90, PENDING:0x91,
+             ATTENTION:0x92 };
+const CFG = { LAYOUT:1, REQUIRE_PIN:2, MANAGER_URL:3 };
+const ST = ['ok','vault is locked','declined on the device','device error',
+            'vault is full','value out of range','device is busy'];
+const FRAME = 63, CHUNK = 60;
+
+// Layout names, in the same order as pp_layout_t.
+const LAYOUTS = ['US','German','Spanish','French','Italian','Portuguese',
+                 'Swedish','Danish','Hungarian','Portuguese (Brazil)'];
+
+const FILTERS = [{ vendorId: 0x303a, usagePage: 0xff00 }];
+
+let device = null;
+// Both collections live on one HID interface, so each carries its own
+// report ID. Discovered from the descriptor rather than hardcoded,
+// because the IDs depend on the order the firmware registers its HID
+// devices and would break silently if that ever changed.
+let outReportId = 0, inReportId = 0;
+let entries = [], listBuf = [];
+let pendingResolve = null;
+let deviceState = { unlocked: 0, lockMode: 0, layout: 0 };
+
+const $ = id => document.getElementById(id);
+const log = msg => {
+  const t = new Date().toLocaleTimeString();
+  $('log').textContent += `[${t}] ${msg}\n`;
+  $('log').scrollTop = 1e9;
+};
+
+function setStatus(text, cls) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+// ---- framing ----------------------------------------------------------
+// Reports are fixed width, so every frame is padded to 63 bytes and
+// carries its own payload length. Messages longer than one chunk set the
+// first/last flags so the device can reassemble them.
+async function send(opcode, payload = new Uint8Array(0)) {
+  if (!device) throw new Error('not connected');
+  let off = 0;
+  do {
+    const n = Math.min(CHUNK, payload.length - off);
+    const frame = new Uint8Array(FRAME);
+    frame[0] = opcode;
+    frame[1] = (off === 0 ? 1 : 0) | ((off + n >= payload.length) ? 2 : 0);
+    frame[2] = n;
+    frame.set(payload.subarray(off, off + n), 3);
+    await device.sendReport(outReportId, frame);
+    off += n;
+  } while (off < payload.length);
+}
+
+const str = s => new TextEncoder().encode(s ?? '');
+
+function joinNul(...parts) {
+  const chunks = [];
+  for (const p of parts) { chunks.push(str(p)); chunks.push(new Uint8Array([0])); }
+  const out = new Uint8Array(chunks.reduce((a, c) => a + c.length, 0));
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+
+// Wait for the device's RESULT. PENDING means it is showing the
+// confirmation dialog and waiting for a human, which can take as long as
+// it takes - so there is deliberately no timeout.
+const awaitResult = () => new Promise(res => { pendingResolve = res; });
+
+// ---- the device asking for attention ----------------------------------
+// Sent when Settings is pressed on the device. A background tab cannot
+// focus itself, so do what a page legitimately can: highlight the
+// settings card, and post a notification the user can click.
+function comeForward() {
+  log('device asked for the settings page');
+  const card = $('settings');
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.add('flash');
+  setTimeout(() => card.classList.remove('flash'), 2000);
+
+  if ('Notification' in window && Notification.permission === 'granted') {
+    const n = new Notification('Password Wallet', { body: 'Settings opened from the device' });
+    n.onclick = () => { window.focus(); n.close(); };
+  }
+}
+
+function onReport(event) {
+  if (inReportId && event.reportId !== inReportId) return;
+  const d = new Uint8Array(event.data.buffer);
+  const op = d[0], len = d[2];
+  const body = d.subarray(3, 3 + len);
+
+  switch (op) {
+    case OP.STATUS_REPLY: {
+      const [ver, unlocked, mode, count, layout] = body;
+      deviceState = { unlocked, lockMode: mode, layout };
+      applyStateToControls();
+      setStatus(unlocked ? `Connected - ${count} entries` : 'Connected - device is locked',
+                unlocked ? 'on' : 'err');
+      log(`status: v${ver} unlocked=${unlocked} pin=${mode ? 'on' : 'off'} entries=${count} layout=${LAYOUTS[layout] ?? layout}`);
+      break;
+    }
+    case OP.ITEM: {
+      const idx = body[0];
+      const [label, user] = new TextDecoder().decode(body.subarray(1)).split('\0');
+      listBuf.push({ index: idx, label, user });
+      break;
+    }
+    case OP.LIST_END:
+      entries = listBuf; listBuf = [];
+      render();
+      break;
+    case OP.PENDING:
+      setStatus('Confirm on the device...', '');
+      log('waiting for you to confirm on the device');
+      break;
+    case OP.ATTENTION:
+      comeForward();
+      break;
+    case OP.RESULT: {
+      const [reqOp, status] = body;
+      log(`result for 0x${reqOp.toString(16)}: ${ST[status] ?? status}`);
+      if (pendingResolve) { const r = pendingResolve; pendingResolve = null; r(status); }
+      break;
+    }
+  }
+}
+
+// ---- UI ---------------------------------------------------------------
+function applyStateToControls() {
+  $('s_layout').value = String(deviceState.layout);
+  $('s_pin').checked = deviceState.lockMode === 1;
+  $('pinNote').textContent = deviceState.lockMode === 1
+    ? 'The key is derived from your PIN and never stored.'
+    : 'The key is stored on the device, so anyone holding it can read every password.';
+  $('pinNote').className = 'note' + (deviceState.lockMode === 1 ? '' : ' danger');
+}
+
+function render() {
+  const tb = $('rows');
+  tb.innerHTML = '';
+  if (!entries.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">No entries yet</td></tr>';
+    return;
+  }
+  for (const e of entries) {
+    const tr = document.createElement('tr');
+    for (const text of [e.index, e.label, e.user]) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    const td = document.createElement('td');
+    const del = document.createElement('button');
+    del.textContent = 'Delete';
+    del.className = 'danger';
+    del.onclick = () => removeEntry(e.index);
+    td.appendChild(del);
+    tr.appendChild(td);
+    tb.appendChild(tr);
+  }
+}
+
+async function refresh() {
+  listBuf = [];
+  await send(OP.STATUS);
+  await send(OP.LIST);
+}
+
+async function removeEntry(index) {
+  setStatus('Confirm on the device...', '');
+  await send(OP.DELETE, new Uint8Array([index]));
+  const status = await awaitResult();
+  if (status === 0) await refresh();
+  else setStatus(ST[status] ?? 'failed', 'err');
+}
+
+// Tell the device where this page lives.
+//
+// The scheme is stripped before sending: the device stores host-and-path
+// only and prepends https:// itself, so there is no way for a page to
+// hand it a file:// address or anything else that Run would treat as a
+// command rather than a navigation. A file:// page therefore cannot pair
+// at all, which is deliberate - a local path is machine-specific and is
+// exactly the thing this feature exists to get away from.
+$('pairPage').onclick = async () => {
+  const here = window.location.href;
+  if (!here.startsWith('https://')) {
+    $('pairNote').className = 'note danger';
+    $('pairNote').textContent =
+      'This page is on ' + window.location.protocol + ', which cannot be shared ' +
+      'between PCs. Host it over https and open it from there.';
+    return;
+  }
+  // Drop the scheme, and any trailing query/fragment the device has no use for.
+  const hostpath = here.slice('https://'.length).split(/[?#]/)[0];
+
+  // field id, then a NUL-terminated string - the shape dispatch() expects.
+  const body = str(hostpath);
+  const payload = new Uint8Array(1 + body.length + 1);
+  payload[0] = CFG.MANAGER_URL;
+  payload.set(body, 1);
+  payload[payload.length - 1] = 0;
+
+  setStatus('Confirm on the device...', '');
+  await send(OP.SET_CONFIG, payload);
+  const st = await awaitResult();
+  if (st === 0) {
+    $('pairNote').className = 'note';
+    $('pairNote').textContent = 'The device will open this page from now on.';
+    setStatus('Settings page paired', 'on');
+  } else {
+    setStatus(ST[st] ?? 'failed', 'err');
+  }
+};
+
+$('saveSettings').onclick = async () => {
+  const layout = Number($('s_layout').value);
+  const wantPin = $('s_pin').checked ? 1 : 0;
+
+  if (layout !== deviceState.layout) {
+    await send(OP.SET_CONFIG, new Uint8Array([CFG.LAYOUT, layout]));
+    const st = await awaitResult();
+    if (st !== 0) { setStatus(ST[st] ?? 'failed', 'err'); return; }
+    log(`layout saved: ${LAYOUTS[layout]}`);
+  }
+
+  if (wantPin !== (deviceState.lockMode === 1 ? 1 : 0)) {
+    setStatus(wantPin ? 'Choose a PIN on the device...' : 'Confirm on the device...', '');
+    await send(OP.SET_CONFIG, new Uint8Array([CFG.REQUIRE_PIN, wantPin]));
+    const st = await awaitResult();
+    if (st !== 0) { setStatus(ST[st] ?? 'failed', 'err'); return; }
+    log(wantPin ? 'device is asking you to choose a PIN' : 'PIN requirement removed');
+  }
+
+  await refresh();
+  setStatus('Settings saved', 'on');
+};
+
+$('addForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const label = $('f_label').value.trim();
+  const user = $('f_user').value.trim();
+  const secret = $('f_secret').value;
+  if (!label || !secret) return;
+
+  setStatus('Confirm on the device...', '');
+  await send(OP.ADD, joinNul(label, user, secret));
+  const status = await awaitResult();
+
+  // Clear the password whatever happened - no reason to leave it in the DOM.
+  $('f_secret').value = '';
+  if (status === 0) {
+    $('f_label').value = ''; $('f_user').value = '';
+    await refresh();
+  } else {
+    setStatus(ST[status] ?? 'failed', 'err');
+  }
+};
+
+async function attach(dev) {
+  device = dev;
+  const vendor = device.collections.find(c => c.usagePage === 0xff00);
+  if (!vendor) {
+    setStatus('No vendor collection on that device', 'err');
+    log('the chosen device has no 0xFF00 collection - wrong device?');
+    device = null;
+    return;
+  }
+  outReportId = vendor.outputReports?.[0]?.reportId ?? 0;
+  inReportId = vendor.inputReports?.[0]?.reportId ?? 0;
+  log(`vendor collection: out report id ${outReportId}, in report id ${inReportId}`);
+
+  if (!device.opened) await device.open();
+  device.addEventListener('inputreport', onReport);
+
+  for (const el of ['refresh', 'addBtn', 's_layout', 's_pin', 'saveSettings', 'pairPage']) {
+    $(el).disabled = false;
+  }
+  setStatus('Connected', 'on');
+  log(`connected to "${device.productName}"`);
+
+  // Asked for, not demanded: it only matters so the Settings button on
+  // the device can raise a notification when this tab is in the
+  // background. Everything works without it.
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission().catch(() => {});
+  }
+  await refresh();
+}
+
+$('connect').onclick = async () => {
+  try {
+    const [dev] = await navigator.hid.requestDevice({ filters: FILTERS });
+    if (!dev) { log('no device chosen'); return; }
+    await attach(dev);
+  } catch (err) {
+    setStatus('Connect failed', 'err');
+    log('error: ' + err.message);
+  }
+};
+
+$('refresh').onclick = () => refresh();
+
+window.addEventListener('load', async () => {
+  $('s_layout').innerHTML = LAYOUTS.map((n, i) => `<option value="${i}">${n}</option>`).join('');
+
+  if (!('hid' in navigator)) {
+    $('unsupported').hidden = false;
+    $('connect').disabled = true;
+    return;
+  }
+  // Reconnect silently to a device already granted in a previous visit,
+  // so reopening this page just works.
+  const granted = await navigator.hid.getDevices();
+  const match = granted.find(d => d.collections.some(c => c.usagePage === 0xff00));
+  if (match) { log('reconnecting to a previously allowed device'); await attach(match); }
+});
+
+navigator.hid?.addEventListener('disconnect', ev => {
+  if (ev.device === device) {
+    device = null; entries = []; render();
+    for (const el of ['refresh', 'addBtn', 's_layout', 's_pin', 'saveSettings', 'pairPage']) {
+      $(el).disabled = true;
+    }
+    setStatus('Disconnected', 'err');
+  }
+});
+</script>
+</body>
+</html>
