@@ -100,7 +100,8 @@
   </div>
 
   <div class="bar">
-    <button id="connect" class="primary">Connect</button>
+    <button id="connect" class="primary">Connect over USB</button>
+    <button id="connectBt">Connect over Bluetooth</button>
     <button id="refresh" disabled>Refresh</button>
     <span id="status" class="status">Not connected</span>
   </div>
@@ -201,6 +202,18 @@ const LAYOUTS = ['US','German','Spanish','French','Italian','Portuguese',
 
 const FILTERS = [{ vendorId: 0x303a, usagePage: 0xff00 }];
 
+// Bluetooth management service. Custom 128-bit UUIDs because Web
+// Bluetooth blocklists the HID service outright - management could not
+// live there even if the device put it there.
+const BT_SVC = '6e2a0001-9f1c-4f6b-9a3d-2b7c5e1a8d40';
+const BT_RX  = '6e2a0002-9f1c-4f6b-9a3d-2b7c5e1a8d40'; // page -> device
+const BT_TX  = '6e2a0003-9f1c-4f6b-9a3d-2b7c5e1a8d40'; // device -> page
+
+// Which transport is live. The framing above is identical either way, so
+// only send() and the connect path differ.
+let transport = null;     // 'hid' | 'bt'
+let btRx = null, btTx = null, btDevice = null;
+
 let device = null;
 // Both collections live on one HID interface, so each carries its own
 // report ID. Discovered from the descriptor rather than hardcoded,
@@ -236,7 +249,7 @@ function setStatus(text, cls) {
 // carries its own payload length. Messages longer than one chunk set the
 // first/last flags so the device can reassemble them.
 async function send(opcode, payload = new Uint8Array(0)) {
-  if (!device) throw new Error('not connected');
+  if (!transport) throw new Error('not connected');
   let off = 0;
   do {
     const n = Math.min(CHUNK, payload.length - off);
@@ -245,7 +258,13 @@ async function send(opcode, payload = new Uint8Array(0)) {
     frame[1] = (off === 0 ? 1 : 0) | ((off + n >= payload.length) ? 2 : 0);
     frame[2] = n;
     frame.set(payload.subarray(off, off + n), 3);
-    await device.sendReport(outReportId, frame);
+    if (transport === 'bt') {
+      // Write-with-response: the device queues frames and we would
+      // rather find out now if one did not land.
+      await btRx.writeValue(frame);
+    } else {
+      await device.sendReport(outReportId, frame);
+    }
     off += n;
   } while (off < payload.length);
 }
@@ -292,7 +311,10 @@ async function comeForward() {
 
 function onReport(event) {
   if (inReportId && event.reportId !== inReportId) return;
-  const d = new Uint8Array(event.data.buffer);
+  onFrame(new Uint8Array(event.data.buffer));
+}
+
+function onFrame(d) {
   const op = d[0], len = d[2];
   const body = d.subarray(3, 3 + len);
 
@@ -516,7 +538,8 @@ async function attach(dev) {
   for (const el of ['refresh', 'addBtn', 's_layout', 's_output', 's_pin', 'saveSettings', 'pairPage', 'bleForget']) {
     $(el).disabled = false;
   }
-  setStatus('Connected', 'on');
+  transport = 'hid';
+  setStatus('Connected over USB', 'on');
   log(`connected to "${device.productName}"`);
 
   // Asked for, not demanded: it only matters so the Settings button on
@@ -527,6 +550,42 @@ async function attach(dev) {
   }
   await refresh();
 }
+
+$('connectBt').onclick = async () => {
+  try {
+    // Filtered by name, not by advertised service: the advertisement is
+    // already carrying the HID UUID and the appearance, and a 128-bit
+    // UUID does not fit alongside them in 31 bytes.
+    btDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'Password Wallet' }],
+      optionalServices: [BT_SVC],
+    });
+    log(`bluetooth: chose "${btDevice.name}"`);
+    const server = await btDevice.gatt.connect();
+    const svc = await server.getPrimaryService(BT_SVC);
+    btRx = await svc.getCharacteristic(BT_RX);
+    btTx = await svc.getCharacteristic(BT_TX);
+    await btTx.startNotifications();
+    btTx.addEventListener('characteristicvaluechanged', ev => {
+      onFrame(new Uint8Array(ev.target.value.buffer));
+    });
+
+    btDevice.addEventListener('gattserverdisconnected', () => {
+      log('bluetooth disconnected');
+      if (transport === 'bt') { transport = null; setStatus('Disconnected', 'err'); }
+    });
+
+    transport = 'bt';
+    for (const el of ['refresh', 'addBtn', 's_layout', 's_output', 's_pin', 'saveSettings', 'pairPage', 'bleForget']) {
+      $(el).disabled = false;
+    }
+    setStatus('Connected over Bluetooth', 'on');
+    await refresh();
+  } catch (err) {
+    setStatus('Bluetooth connect failed', 'err');
+    log('error: ' + err.message);
+  }
+};
 
 $('connect').onclick = async () => {
   try {
